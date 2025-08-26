@@ -479,6 +479,11 @@ Private Sub SeedMissingEnhancementControls(ByVal wb As Workbook)
     If Not HasControlKey(ws, "FeeBase_Post") Then
         WriteControl ws, "FeeBase_Post", "NAV"
     End If
+
+    ' Refresh external tape flag: If TRUE, refresh the asset tape from external CSV on each build/refresh.
+    If Not HasControlKey(ws, "Refresh_External_Tape") Then
+        WriteControl ws, "Refresh_External_Tape", True
+    End If
     If Not HasControlKey(ws, "IP_End_Q") Then
         WriteControl ws, "IP_End_Q", 12
     End If
@@ -693,10 +698,15 @@ Public Sub RNF_RefreshAll()
     ' Step 1: Read control inputs
     Set controlDict = ReadControlInputs(wb)
     
-    ' Step 2: Normalize tape
+    ' Step 2: Normalize tape (or read existing) based on Refresh_External_Tape flag
     Call Status("Normalizing asset tape...")
-    ' Use safe tape normalization that returns header + data and clears any CVErr values
-    tapeData = NormalizeAssetTapeSafe(wb)
+    If ToBool(controlDict("Refresh_External_Tape")) Then
+        ' Use safe tape normalization that returns header + data and clears any CVErr values
+        tapeData = NormalizeAssetTapeSafe(wb)
+    Else
+        ' Use the existing Asset_Tape sheet without re-parsing external CSV
+        tapeData = GetExistingTapeFromSheet(wb)
+    End If
     
     ' Step 3: Build dates
     quarterDates = BuildQuarterDates(controlDict)
@@ -722,9 +732,21 @@ Public Sub RNF_RefreshAll()
     'Call CalculatePhaseAwareFees(waterfallResults, controlDict, numQ)
     Call NormalizeManualCallVector(controlDict)
     
+    ' Step 6: Merge simulation and waterfall results so all arrays are available for reporting
+    Dim combinedResults As Object
+    Set combinedResults = NewDict()
+    Dim k As Variant
+    ' Copy simulation results
+    For Each k In simResults
+        combinedResults(k) = simResults(k)
+    Next k
+    ' Copy waterfall results (overwrites keys if duplicated)
+    For Each k In waterfallResults
+        combinedResults(k) = waterfallResults(k)
+    Next k
     ' Step 6: Write results
     Call Status("Writing results...")
-    Call WriteRunSheet(wb, waterfallResults, quarterDates, controlDict)
+    Call WriteRunSheet(wb, combinedResults, quarterDates, controlDict)
     
     ' FIX 15: Create aliases and table zone BEFORE defining names
     Call CreateRunTableZoneAndAliases(wb)
@@ -734,7 +756,7 @@ Public Sub RNF_RefreshAll()
     
     ' Step 7: Update all reporting sheets
     Call Status("Updating reports...")
-    Call UpdateAllReportingSheets(wb, waterfallResults, controlDict, quarterDates)
+    Call UpdateAllReportingSheets(wb, combinedResults, controlDict, quarterDates)
     
     ' Build and update metrics
     Dim met As Object
@@ -809,9 +831,10 @@ Public Sub CreateParityHarness(wb As Workbook)
     
     ' KPIs
     wsMRef.Range("G1:G4").Value = Application.Transpose(Array("Eq IRR", "A IRR", "B IRR", "Notes"))
-    wsMRef.Range("H1").formula = "=IFERROR(XIRR(B2:B" & (numQ + 1) & ",A2:A" & (numQ + 1) & "),NA())"
-    wsMRef.Range("H2").formula = "=IFERROR(XIRR(C2:C" & (numQ + 1) & ",A2:A" & (numQ + 1) & "),NA())"
-    wsMRef.Range("H3").formula = "=IFERROR(XIRR(D2:D" & (numQ + 1) & ",A2:A" & (numQ + 1) & "),NA())"
+    ' Use zero instead of NA() to avoid #N/A errors when IRR cannot be computed (e.g., zero cashflows)
+    wsMRef.Range("H1").formula = "=IFERROR(XIRR(B2:B" & (numQ + 1) & ",A2:A" & (numQ + 1) & "),0)"
+    wsMRef.Range("H2").formula = "=IFERROR(XIRR(C2:C" & (numQ + 1) & ",A2:A" & (numQ + 1) & "),0)"
+    wsMRef.Range("H3").formula = "=IFERROR(XIRR(D2:D" & (numQ + 1) & ",A2:A" & (numQ + 1) & "),0)"
     
     ' Format
     wsMRef.Columns("A").NumberFormat = "yyyy-mm-dd"
@@ -1328,6 +1351,37 @@ Private Sub ApplyEnhancementDataValidations(wb As Workbook)
 EH:
     RNF_Log "ApplyEnhancementDataValidations", "ERROR: " & Err.Description
 End Sub
+
+'------------------------------------------------------------------------------
+' Returns the current asset tape data from the workbook.  If the Asset_Tape
+' sheet exists and contains data, this function returns its used range as a
+' 2D Variant array.  Used when Refresh_External_Tape is FALSE to avoid
+' re-importing the CSV on every refresh.
+Private Function GetExistingTapeFromSheet(wb As Workbook) As Variant
+    On Error GoTo EH
+    Dim wsTape As Worksheet
+    Set wsTape = Nothing
+    On Error Resume Next
+    Set wsTape = wb.Worksheets("Asset_Tape")
+    On Error GoTo EH
+    If wsTape Is Nothing Then
+        GetExistingTapeFromSheet = Empty
+        Exit Function
+    End If
+    Dim lastRow As Long, lastCol As Long
+    lastRow = wsTape.UsedRange.Rows.Count
+    lastCol = wsTape.UsedRange.Columns.Count
+    If lastRow <= 0 Or lastCol <= 0 Then
+        GetExistingTapeFromSheet = Empty
+        Exit Function
+    End If
+    Dim arr As Variant
+    arr = wsTape.Range(wsTape.Cells(1, 1), wsTape.Cells(lastRow, lastCol)).Value
+    GetExistingTapeFromSheet = arr
+    Exit Function
+EH:
+    GetExistingTapeFromSheet = Empty
+End Function
 
 Private Function BuildPlacardMetricsFromNames() As Object
     Dim m As Object: Set m = NewDict()
@@ -2853,6 +2907,30 @@ Private Sub SetupControlSheet(ws As Worksheet)
     Call FormatControlSheet(ws)
     Call CreateKPIPlacards(ws)
     Call Apply_Patched_Control_Defaults
+
+    ' Apply default assumptions based on selected scenario (Base/Down/Up).
+    ' This routine inspects the Scenario_Selection cell and populates
+    ' related assumption keys with preset values.  Feel free to adjust
+    ' the presets in ApplyScenarioDefaults below to match your desired
+    ' downside or upside scenarios.
+    Call ApplyScenarioDefaults(ws)
+
+    ' Turn off gridlines on the control sheet for a cleaner appearance
+    On Error Resume Next
+    Application.ActiveWindow.DisplayGridlines = False
+    On Error GoTo 0
+
+    ' Resize and replace legacy control buttons.  Remove any existing shapes created
+    ' by prior runs (e.g. oversized buttons) and add the updated button set.
+    Dim shp As Shape
+    For Each shp In ws.Shapes
+        ' Remove legacy buttons (assumes legacy buttons have caption in uppercase)
+        If shp.Type = msoFormControl Or shp.Type = msoOLEControlObject Then
+            shp.Delete
+        End If
+    Next shp
+    ' Add updated control buttons with consistent sizing
+    Call CreateAllButtons(ws.Parent)
 End Sub
 
 Private Sub ApplyControlValidation(ws As Worksheet)
@@ -2889,6 +2967,61 @@ Private Sub ApplyControlValidation(ws As Worksheet)
     End With
     
     ws.Range("C5:C" & lastRow).name = "Ctl_Matrix_Flags_Col"
+End Sub
+
+'-------------------------------------------------------------------------------
+' ApplyScenarioDefaults
+'
+' Reads the Scenario_Selection value from the control sheet and updates key
+' baseline assumptions (e.g., CDR, Recovery, Prepay, Amort) according to
+' predefined Base/Down/Up sets.  This allows users to quickly toggle
+' conservative or optimistic scenarios.  Modify the parameter lists below
+' as needed to suit your business assumptions.
+Private Sub ApplyScenarioDefaults(ws As Worksheet)
+    On Error Resume Next
+    Dim scenCell As Range
+    Set scenCell = ws.Columns(1).Find("Scenario_Selection", LookAt:=xlWhole)
+    If scenCell Is Nothing Then Exit Sub
+    Dim scen As String
+    scen = UCase$(CStr(scenCell.Offset(0, 1).Value))
+    ' Define baseline values for key parameters.  Feel free to extend this list
+    ' with other control keys that vary by scenario.
+    Dim baseVals As Object, downVals As Object, upVals As Object
+    Set baseVals = CreateObject("Scripting.Dictionary")
+    Set downVals = CreateObject("Scripting.Dictionary")
+    Set upVals = CreateObject("Scripting.Dictionary")
+    ' Base (expected) scenario values
+    baseVals("Base_CDR") = 0.02
+    baseVals("Base_Recovery") = 0.65
+    baseVals("Base_Prepay") = 0.05
+    baseVals("Base_Amort") = 0.02
+    ' Down (stress) scenario values
+    downVals("Base_CDR") = 0.05
+    downVals("Base_Recovery") = 0.50
+    downVals("Base_Prepay") = 0.03
+    downVals("Base_Amort") = 0.01
+    ' Up (optimistic) scenario values
+    upVals("Base_CDR") = 0.01
+    upVals("Base_Recovery") = 0.75
+    upVals("Base_Prepay") = 0.07
+    upVals("Base_Amort") = 0.03
+    Dim dictVals As Object
+    Select Case scen
+        Case "DOWN"
+            Set dictVals = downVals
+        Case "UP"
+            Set dictVals = upVals
+        Case Else
+            Set dictVals = baseVals
+    End Select
+    Dim key As Variant
+    For Each key In dictVals.Keys
+        Dim tgt As Range
+        Set tgt = ws.Columns(1).Find(CStr(key), LookAt:=xlWhole)
+        If Not tgt Is Nothing Then
+            tgt.Offset(0, 1).Value = dictVals(key)
+        End If
+    Next key
 End Sub
 
 Private Sub FormatControlSheet(ws As Worksheet)
@@ -6050,10 +6183,39 @@ Private Sub RenderPortfolioStratifications(wb As Workbook)
     ws.Cells(r, 2).formula = "=SUMPRODUCT(AssetTape!B:B,AssetTape!J:J)/SUM(AssetTape!B:B)"
     ws.Cells(r, 2).Style = "SG_Pct"
     
-    ws.Columns("B:B").Style = "SG_Currency_K"
-    ws.Columns("C:C").Style = "SG_Pct"
+    ' Apply number formats only to specific ranges.  Setting the entire B-column
+    ' to a currency style caused WA metrics (WAM, WA Spread, WA LTV) to appear as dollars.
+    ' Format the distribution columns individually and leave other rows to their
+    ' explicitly defined formats.
+    ws.Range("B7:B11").Style = "SG_Currency_K"
+    ws.Range("C7:C11").Style = "SG_Pct"
+    ws.Range("B15:B19").Style = "SG_Currency_K"
+    ws.Range("C15:C19").Style = "SG_Pct"
     
     Call SG615_ApplyStylePack(ws, "", "")
+    ' Hide gridlines for cleaner presentation
+    On Error Resume Next
+    Application.ActiveWindow.DisplayGridlines = False
+    On Error GoTo 0
+
+    ' Add a simple pie chart for the industry distribution.  This chart
+    ' references the first five industry rows (rows 7-11) of the
+    ' distribution table.  The chart is positioned to the right of the table
+    ' and sized proportionally.  Enumerations (e.g., xlPie) are avoided to
+    ' minimize cross-compatibility issues; numeric constants are used instead.
+    Dim chartObj As ChartObject
+    On Error Resume Next
+    Set chartObj = ws.ChartObjects.Add(Left:=350, Top:=50, Width:=250, Height:=180)
+    If Not chartObj Is Nothing Then
+        With chartObj.Chart
+            .ChartType = 5 ' xlPie
+            .SetSourceData Source:=ws.Range("B7:B11")
+            .SeriesCollection(1).XValues = ws.Range("A7:A11")
+            .HasTitle = True
+            .ChartTitle.Text = "Industry Distribution"
+        End With
+    End If
+    On Error GoTo 0
 End Sub
 
 Private Sub RenderAssetPerformance(wb As Workbook, results As Object, quarterDates() As Date)
@@ -6123,6 +6285,10 @@ Private Sub RenderAssetPerformance(wb As Workbook, results As Object, quarterDat
     ws.Columns("F:F").Style = "SG_Pct"
     
     Call SG615_ApplyStylePack(ws, "", "")
+    ' Hide gridlines on this sheet
+    On Error Resume Next
+    Application.ActiveWindow.DisplayGridlines = False
+    On Error GoTo 0
 End Sub
 
 Private Function RNF_IsDateArrayInitialized(arr() As Date) As Boolean
@@ -6514,7 +6680,7 @@ Private Sub RenderWaterfallSchedule(wb As Workbook, results As Object, controlDi
         ws.Cells(r, 18).formula = "=P" & r
     Next q
     
-    ws.Columns("A:A").NumberFormat = "mm/dd/yyyy"
+    ws.Columns("A:A").NumberFormat = "mm-dd-yy"
     ws.Columns("B:P").Style = "SG_Currency_K"
     ws.Columns("Q:Q").NumberFormat = "0.00x"
     ws.Columns("R:R").NumberFormat = "$#,##0;[Red]-$#,##0"
@@ -6617,9 +6783,15 @@ Private Sub RenderPortfolioHHI(wb As Workbook)
     
     r = r + 1
     ws.Cells(r, 6).Value = "HHI Score"
-    ws.Cells(r, 7).formula = "=SUMPRODUCT((AssetTape!B:B/SUM(AssetTape!B:B))^2)*10000"
+    ' Compute the HHI using only numeric Par rows (B5:B[lastRow]) to avoid #VALUE! errors from header rows or blanks.
+    Dim lastParRow As Long
+    With wb.Worksheets("AssetTape")
+        lastParRow = .Cells(.Rows.Count, 2).End(xlUp).Row
+    End With
+    ' Put the HHI formula into row 8 (G8) so other sheets can reference it consistently.  Limit range to numeric rows.
+    ws.Cells(r, 7).formula = "=SUMPRODUCT((AssetTape!B5:B" & lastParRow & "/SUM(AssetTape!B5:B" & lastParRow & "))^2)*10000"
     ws.Cells(r, 7).NumberFormat = "#,##0"
-    
+
     r = r + 1
     ws.Cells(r, 6).Value = "Effective N"
     ws.Cells(r, 7).formula = "=10000/G8"
@@ -8381,7 +8553,12 @@ Private Function SimulateTapeEnhanced(tapeData As Variant, dict As Object, quart
             End If
         Next r
     End If
-    outstanding(0) = totalPar
+    ' If asset tape sum is zero or very small, scale initial balance to total capital
+    If totalPar <= 0# Then
+        outstanding(0) = ToDbl(dict("Total_Capital"))
+    Else
+        outstanding(0) = totalPar
+    End If
     
     ' Read annual rates from control
     Dim cdrAnn As Double, recPct As Double, prepAnn As Double, amortAnn As Double
@@ -8516,6 +8693,13 @@ Private Function RunWaterfallEnhanced(sim As Object, dict As Object, dates() As 
 
     ' Arrays to hold recomputed coverage metrics using asset vs note balances
     Dim ocA_arr() As Double, ocB_arr() As Double
+
+    ' Derived arrays for balances, interest due/paid/PIK, DSCR, advance rate
+    Dim aBalArr() As Double, bBalArr() As Double
+    Dim aIntDueArr() As Double, bIntDueArr() As Double
+    Dim aIntPIKArr() As Double, bIntPIKArr() As Double
+    Dim dscrArr() As Double, advRateArr() As Double
+    Dim icA_arr() As Double, icB_arr() As Double
     ReDim cashIn(0 To numQ - 1)
     ReDim feesServicer(0 To numQ - 1)
     ReDim feesMgmt(0 To numQ - 1)
@@ -8535,6 +8719,17 @@ Private Function RunWaterfallEnhanced(sim As Object, dict As Object, dates() As 
     ReDim lpCalls(0 To numQ - 1)
     ReDim ocA_arr(0 To numQ - 1)
     ReDim ocB_arr(0 To numQ - 1)
+
+    ReDim aBalArr(0 To numQ - 1)
+    ReDim bBalArr(0 To numQ - 1)
+    ReDim aIntDueArr(0 To numQ - 1)
+    ReDim bIntDueArr(0 To numQ - 1)
+    ReDim aIntPIKArr(0 To numQ - 1)
+    ReDim bIntPIKArr(0 To numQ - 1)
+    ReDim dscrArr(0 To numQ - 1)
+    ReDim advRateArr(0 To numQ - 1)
+    ReDim icA_arr(0 To numQ - 1)
+    ReDim icB_arr(0 To numQ - 1)
     
     ' Initial outstanding note balance = Total_Capital
     outstandingNote(0) = ToDbl(dict("Total_Capital"))
@@ -8640,15 +8835,34 @@ Private Function RunWaterfallEnhanced(sim As Object, dict As Object, dates() As 
         Dim aOut As Double, bOut As Double
         aOut = outstandingNote(q) * pctA
         bOut = outstandingNote(q) * pctB
+
+        ' Capture tranche balances for reporting
+        aBalArr(q) = aOut
+        bBalArr(q) = bOut
         
         ' Pay interest
         Dim aIntDue As Double, bIntDue As Double
         aIntDue = aOut * rateA / 4#
         bIntDue = bOut * rateB / 4#
+        ' Store due interest for reporting
+        aIntDueArr(q) = aIntDue
+        bIntDueArr(q) = bIntDue
         aInt(q) = Application.Min(avail, aIntDue)
         avail = avail - aInt(q)
         bInt(q) = Application.Min(avail, bIntDue)
         avail = avail - bInt(q)
+
+        ' PIK interest is any unpaid portion of due interest
+        aIntPIKArr(q) = aIntDue - aInt(q)
+        bIntPIKArr(q) = bIntDue - bInt(q)
+        ' When PIK is disabled, convert any unpaid interest into a capital call (LP call)
+        ' instead of allowing it to accrete to the note.  This prevents the model
+        ' from showing PIK balances when PIK is switched off on the Control sheet.
+        If Not ToBool(dict("Enable_PIK")) Then
+            lpCalls(q) = lpCalls(q) + aIntPIKArr(q) + bIntPIKArr(q)
+            aIntPIKArr(q) = 0#
+            bIntPIKArr(q) = 0#
+        End If
         
         ' Determine if turbo principal can be paid
         Dim ocTest As Boolean
@@ -8691,6 +8905,19 @@ Private Function RunWaterfallEnhanced(sim As Object, dict As Object, dates() As 
             turboFlag(q) = 0
         End If
     Next q
+
+    ' Compute DSCR and advance rate for each period
+    Dim totalIntDue As Double
+    For q = 0 To numQ - 1
+        totalIntDue = aIntDueArr(q) + bIntDueArr(q)
+        ' Debt service coverage ratio: available interest cash (interest + commitment fees) divided by total interest due
+        dscrArr(q) = SafeDivide(sim("Interest")(q) + sim("CommitmentFees")(q), totalIntDue, RATIO_SENTINEL)
+        ' Advance rate: total note balances / asset balance
+        advRateArr(q) = SafeDivide(aBalArr(q) + bBalArr(q), sim("Outstanding")(q), 0)
+        ' Interest coverage ratios by tranche
+        icA_arr(q) = SafeDivide(sim("Interest")(q) + sim("CommitmentFees")(q), aIntDueArr(q), RATIO_SENTINEL)
+        icB_arr(q) = SafeDivide(sim("Interest")(q) + sim("CommitmentFees")(q), bIntDueArr(q), RATIO_SENTINEL)
+    Next q
     
     ' Assign results
     results("CashIn") = cashIn
@@ -8716,6 +8943,24 @@ Private Function RunWaterfallEnhanced(sim As Object, dict As Object, dates() As 
     ' Coverage metrics recomputed using asset/note balances
     results("OC_A") = ocA_arr
     results("OC_B") = ocB_arr
+
+    ' Derived balances and interest arrays
+    results("A_Bal") = aBalArr
+    results("B_Bal") = bBalArr
+    results("A_IntDue") = aIntDueArr
+    results("A_IntPd") = aInt
+    results("A_IntPIK") = aIntPIKArr
+    results("A_Prin") = aPrin
+    results("B_IntDue") = bIntDueArr
+    results("B_IntPd") = bInt
+    results("B_IntPIK") = bIntPIKArr
+    results("B_Prin") = bPrin
+    results("DSCR") = dscrArr
+    results("AdvRate") = advRateArr
+    ' Reserve top-ups (alias to reserve draws for reporting)
+    results("Reserve_TopUp") = reserveDraw
+    results("IC_A") = icA_arr
+    results("IC_B") = icB_arr
 
     ' Propagate key simulated components into waterfall results so WriteRunSheet can display them
     On Error Resume Next
